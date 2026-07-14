@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import re
 import time
 import urllib.error
 import urllib.request
+import wave
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -19,6 +22,9 @@ except ImportError:  # Allows lightweight unit tests outside a ComfyUI install.
 
 
 MAX_SEED = 2**53 - 1
+S2V_FPS = 16
+S2V_MIN_FRAMES = 73
+S2V_MAX_FRAMES = 97
 
 
 def _first(value: Any, default: Any = None) -> Any:
@@ -37,6 +43,25 @@ def _extract_json(text: str) -> dict[str, Any]:
     return json.loads(cleaned[start : end + 1])
 
 
+def _stable_seed(base_seed: int, key: str) -> int:
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    offset = int.from_bytes(digest[:7], "big")
+    return int((base_seed + offset) % MAX_SEED)
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in re.split(r"[,，、|]", value) if item.strip()]
+    return []
+
+
+def _s2v_frame_count(duration: float) -> int:
+    requested = max(S2V_MIN_FRAMES, min(S2V_MAX_FRAMES, round(duration * S2V_FPS)))
+    return int(1 + 4 * round((requested - 1) / 4))
+
+
 def _normalize_storyboard(
     payload: dict[str, Any],
     *,
@@ -50,6 +75,36 @@ def _normalize_storyboard(
     if not isinstance(raw_shots, list) or not raw_shots:
         raise ValueError("The LLM response must contain a non-empty 'shots' array.")
 
+    continuity_bible = payload.get("continuity_bible", {})
+    if not isinstance(continuity_bible, dict):
+        continuity_bible = {}
+    raw_characters = continuity_bible.get("characters", [])
+    characters = {}
+    if isinstance(raw_characters, list):
+        for index, character in enumerate(raw_characters):
+            if not isinstance(character, dict):
+                continue
+            character_id = str(character.get("id") or f"C{index + 1:02d}").strip()
+            name = str(character.get("name") or character_id).strip()
+            identity_anchor = str(
+                character.get("identity_anchor")
+                or character.get("immutable_visual_description")
+                or ""
+            ).strip()
+            gender = str(character.get("gender", "unknown")).strip().lower()
+            voice_profile = str(character.get("voice_profile", "")).strip().lower()
+            if voice_profile not in {"male", "female", "narrator"}:
+                voice_profile = "female" if gender in {"female", "woman", "女"} else "male"
+            characters[character_id] = {
+                **character,
+                "id": character_id,
+                "name": name,
+                "identity_anchor": identity_anchor,
+                "voice_profile": voice_profile,
+            }
+    if characters:
+        continuity_bible["characters"] = list(characters.values())
+
     shots = []
     for index, raw in enumerate(raw_shots[:max_shots]):
         if not isinstance(raw, dict):
@@ -60,32 +115,131 @@ def _normalize_storyboard(
         if not image_prompt or not video_prompt:
             continue
 
-        if style_prompt and style_prompt.lower() not in image_prompt.lower():
-            image_prompt = f"{image_prompt}. Global visual style: {style_prompt}"
-        if avoid_prompt:
-            image_prompt = f"{image_prompt}. Exclude: {avoid_prompt}"
-        if "identity" not in video_prompt.lower():
-            video_prompt = (
-                f"{video_prompt}. Maintain exact character identity, facial features, costume, "
-                "scene layout, and visual style from the start image."
+        character_ids = _as_string_list(raw.get("characters"))
+        speaker_id = str(raw.get("speaker_id", "")).strip()
+        if speaker_id and speaker_id not in character_ids:
+            character_ids.append(speaker_id)
+        primary_character_id = str(raw.get("primary_character_id", "")).strip()
+        if primary_character_id not in character_ids:
+            primary_character_id = character_ids[0] if character_ids else ""
+
+        identity_lines = []
+        for character_id in character_ids:
+            character = characters.get(character_id)
+            if not character:
+                continue
+            anchor = character.get("identity_anchor", "")
+            if anchor:
+                identity_lines.append(
+                    f"{character_id}「{character['name']}」固定身份：{anchor}"
+                )
+        if identity_lines:
+            image_prompt = (
+                f"【角色身份锁定，不得改变脸型、五官比例、发型和年龄】{'；'.join(identity_lines)}。"
+                f"【本镜画面】{image_prompt}"
             )
+
+        continuity = str(raw.get("continuity_from_previous", "")).strip()
+        if continuity and index > 0:
+            image_prompt = f"【承接上一镜】{continuity}。【连续性要求】保持轴线、视线方向、服装、道具位置、时间和光线一致。{image_prompt}"
+        if style_prompt and style_prompt not in image_prompt:
+            image_prompt = f"{image_prompt}。【统一视觉风格】{style_prompt}"
+        if avoid_prompt:
+            image_prompt = f"{image_prompt}。【排除】{avoid_prompt}"
+
+        dialogue_text = str(raw.get("dialogue_text", "")).strip().strip("“”\"'")
+        narration_text = str(
+            raw.get("narration_text") or raw.get("narration_or_dialogue") or ""
+        ).strip()
+        audio_type = str(raw.get("audio_type", "")).strip().lower()
+        if dialogue_text:
+            audio_type = "dialogue"
+        elif audio_type not in {"dialogue", "narration"}:
+            audio_type = "narration" if narration_text else "none"
+
+        speech_framing = str(raw.get("speech_framing", "none")).strip().lower()
+        if audio_type == "dialogue":
+            if speech_framing not in {"group", "closeup"}:
+                speech_framing = "closeup" if len(dialogue_text) >= 10 else "group"
+            speaker = characters.get(speaker_id, {})
+            speaker_name = speaker.get("name", speaker_id or "发言者")
+            if speech_framing == "group":
+                speech_instruction = (
+                    f"群像对话镜头：只有{speaker_name}说话，使用普通话清晰说出“{dialogue_text}”，"
+                    "嘴唇、下颌和面部肌肉严格跟随真实语音音素自然运动；发言者口部无遮挡且清晰可见。"
+                    "其他人物保持闭嘴，只做自然倾听、视线和轻微表情反应，禁止多人同时动嘴。"
+                )
+            else:
+                speech_instruction = (
+                    f"切到{speaker_name}的近景或特写，正面或轻微四分之三侧面，口部无遮挡；"
+                    f"{speaker_name}使用普通话清晰说出“{dialogue_text}”，嘴唇、下颌和面部肌肉严格跟随"
+                    "真实语音音素逐字自然运动，保持同一张脸、同一发型和同一服装。其他人物不抢镜。"
+                )
+            video_prompt = f"{video_prompt}。{speech_instruction}"
+            tts_text = dialogue_text
+            voice_profile = characters.get(speaker_id, {}).get("voice_profile", "male")
+        else:
+            speech_framing = "none"
+            video_prompt = f"{video_prompt}。所有可见人物保持闭嘴，不做说话口型，只做符合情境的自然呼吸和表情变化。"
+            tts_text = ""
+            voice_profile = "narrator"
+
+        video_prompt = (
+            f"{video_prompt}。严格保持起始图中的人物身份、五官、发型、服装、场景布局、色调和光线不变；"
+            "动作连续、物理合理，不新增人物，不瞬移，不改变镜头轴线。"
+        )
 
         try:
             duration = float(raw.get("duration_seconds", seconds_per_shot))
         except (TypeError, ValueError):
             duration = seconds_per_shot
-        duration = round(max(2.0, min(10.0, duration)), 2)
+        duration = round(max(4.5, min(6.0, duration)), 2)
+        frame_count = _s2v_frame_count(duration)
+        duration = round(frame_count / S2V_FPS, 4)
+
+        scene_id = str(raw.get("scene_id") or "SC001").strip()
+        sequence_id = str(raw.get("sequence_id") or scene_id).strip()
+        transition = str(raw.get("transition", "hard_cut")).strip().lower()
+        transition_aliases = {
+            "cut": "hard_cut",
+            "硬切": "hard_cut",
+            "直接切": "hard_cut",
+            "dissolve": "dissolve",
+            "叠化": "dissolve",
+            "淡入淡出": "dissolve",
+            "match": "match_cut",
+            "匹配剪辑": "match_cut",
+        }
+        transition = transition_aliases.get(transition, transition)
+        if transition not in {"hard_cut", "dissolve", "match_cut"}:
+            transition = "hard_cut"
+
+        seed_key = f"character:{primary_character_id}" if primary_character_id else f"scene:{scene_id}"
 
         shot_id = str(raw.get("id") or f"S{index + 1:03d}").strip()
         shots.append(
             {
                 "id": shot_id,
                 "title": str(raw.get("title", f"Shot {index + 1}")).strip(),
+                "sequence_id": sequence_id,
+                "scene_id": scene_id,
+                "characters": character_ids,
+                "primary_character_id": primary_character_id,
+                "continuity_from_previous": continuity,
+                "transition": transition,
                 "duration_seconds": duration,
+                "frame_count": frame_count,
                 "image_prompt": image_prompt,
                 "video_prompt": video_prompt,
-                "narration_or_dialogue": str(raw.get("narration_or_dialogue", "")).strip(),
-                "seed": int((base_seed + index * 104729) % MAX_SEED),
+                "audio_type": audio_type,
+                "speaker_id": speaker_id,
+                "speech_framing": speech_framing,
+                "dialogue_text": dialogue_text,
+                "narration_text": narration_text,
+                "tts_text": tts_text,
+                "voice_profile": voice_profile,
+                "seed_group": seed_key,
+                "seed": _stable_seed(base_seed, seed_key),
             }
         )
 
@@ -94,12 +248,27 @@ def _normalize_storyboard(
 
     return {
         "project": payload.get("project", {}),
-        "continuity_bible": payload.get("continuity_bible", {}),
+        "continuity_bible": continuity_bible,
         "shots": shots,
     }
 
 
-def _concat_frame_batches(frame_batches: list[torch.Tensor], crossfade_frames: int) -> torch.Tensor:
+def _transition_overlap(
+    index: int,
+    transitions: list[str] | None,
+    crossfade_frames: int,
+) -> int:
+    if not transitions or index >= len(transitions):
+        return max(0, crossfade_frames)
+    transition = str(transitions[index]).strip().lower()
+    return max(0, crossfade_frames) if transition == "dissolve" else 0
+
+
+def _concat_frame_batches(
+    frame_batches: list[torch.Tensor],
+    crossfade_frames: int,
+    transitions: list[str] | None = None,
+) -> torch.Tensor:
     if not frame_batches:
         raise ValueError("At least one frame batch is required.")
 
@@ -107,7 +276,7 @@ def _concat_frame_batches(frame_batches: list[torch.Tensor], crossfade_frames: i
     if result.ndim != 4:
         raise ValueError("Video frames must use ComfyUI's [frames, height, width, channels] shape.")
 
-    for next_frames in frame_batches[1:]:
+    for index, next_frames in enumerate(frame_batches[1:], start=1):
         if next_frames.ndim != 4:
             raise ValueError("Video frames must use ComfyUI's [frames, height, width, channels] shape.")
         if result.shape[1:] != next_frames.shape[1:]:
@@ -116,7 +285,11 @@ def _concat_frame_batches(frame_batches: list[torch.Tensor], crossfade_frames: i
                 f"and {tuple(next_frames.shape[1:])}."
             )
 
-        overlap = min(max(0, crossfade_frames), result.shape[0], next_frames.shape[0])
+        overlap = min(
+            _transition_overlap(index, transitions, crossfade_frames),
+            result.shape[0],
+            next_frames.shape[0],
+        )
         if overlap == 0:
             result = torch.cat((result, next_frames), dim=0)
             continue
@@ -134,19 +307,146 @@ def _concat_frame_batches(frame_batches: list[torch.Tensor], crossfade_frames: i
     return result
 
 
+def _silence_audio(duration: float, sample_rate: int = 24000) -> dict[str, Any]:
+    samples = max(1, round(duration * sample_rate))
+    return {
+        "waveform": torch.zeros((1, 1, samples), dtype=torch.float32),
+        "sample_rate": sample_rate,
+    }
+
+
+def _fit_audio_duration(audio: dict[str, Any], duration: float) -> dict[str, Any]:
+    waveform = audio["waveform"]
+    sample_rate = int(audio["sample_rate"])
+    if waveform.ndim == 1:
+        waveform = waveform.view(1, 1, -1)
+    elif waveform.ndim == 2:
+        waveform = waveform.unsqueeze(0)
+    target_samples = max(1, round(duration * sample_rate))
+    if waveform.shape[-1] > target_samples:
+        waveform = waveform[..., :target_samples]
+    elif waveform.shape[-1] < target_samples:
+        waveform = torch.nn.functional.pad(waveform, (0, target_samples - waveform.shape[-1]))
+    return {"waveform": waveform.contiguous(), "sample_rate": sample_rate}
+
+
+def _decode_wav_bytes(data: bytes) -> dict[str, Any]:
+    if not data.startswith(b"RIFF"):
+        raise ValueError("TTS service did not return a WAV file.")
+    with wave.open(io.BytesIO(data), "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_rate = wav_file.getframerate()
+        sample_width = wav_file.getsampwidth()
+        raw = wav_file.readframes(wav_file.getnframes())
+
+    if sample_width == 1:
+        samples = torch.frombuffer(bytearray(raw), dtype=torch.uint8).float()
+        samples = (samples - 128.0) / 128.0
+    elif sample_width == 2:
+        samples = torch.frombuffer(bytearray(raw), dtype=torch.int16).float() / 32768.0
+    elif sample_width == 3:
+        bytes_tensor = torch.tensor(list(raw), dtype=torch.int32).view(-1, 3)
+        samples = (
+            bytes_tensor[:, 0]
+            | (bytes_tensor[:, 1] << 8)
+            | (bytes_tensor[:, 2] << 16)
+        )
+        samples = torch.where(samples >= 2**23, samples - 2**24, samples).float() / float(2**23)
+    elif sample_width == 4:
+        samples = torch.frombuffer(bytearray(raw), dtype=torch.int32).float() / float(2**31)
+    else:
+        raise ValueError(f"Unsupported WAV sample width: {sample_width} bytes.")
+
+    if samples.numel() % channels != 0:
+        raise ValueError("Invalid interleaved WAV sample count.")
+    waveform = samples.view(-1, channels).transpose(0, 1).unsqueeze(0).contiguous()
+    return {"waveform": waveform, "sample_rate": sample_rate}
+
+
+def _concat_audio_batches(
+    audio_batches: list[dict[str, Any] | None],
+    frame_counts: list[int],
+    fps: float,
+    transitions: list[str] | None,
+    crossfade_frames: int,
+) -> dict[str, Any] | None:
+    first_audio = next((audio for audio in audio_batches if audio is not None), None)
+    if first_audio is None:
+        return None
+
+    sample_rate = int(first_audio["sample_rate"])
+    fitted = []
+    for audio, frames in zip(audio_batches, frame_counts):
+        duration = frames / fps
+        if audio is None:
+            fitted.append(_silence_audio(duration, sample_rate)["waveform"])
+            continue
+        waveform = audio["waveform"]
+        if int(audio["sample_rate"]) != sample_rate:
+            import torchaudio
+
+            waveform = torchaudio.functional.resample(
+                waveform,
+                int(audio["sample_rate"]),
+                sample_rate,
+            )
+        fitted.append(_fit_audio_duration(
+            {"waveform": waveform, "sample_rate": sample_rate},
+            duration,
+        )["waveform"])
+
+    result = fitted[0]
+    for index, next_audio in enumerate(fitted[1:], start=1):
+        overlap_frames = _transition_overlap(index, transitions, crossfade_frames)
+        overlap_samples = min(
+            round(overlap_frames / fps * sample_rate),
+            result.shape[-1],
+            next_audio.shape[-1],
+        )
+        if overlap_samples <= 0:
+            result = torch.cat((result, next_audio), dim=-1)
+            continue
+        weights = torch.linspace(
+            0.0,
+            1.0,
+            overlap_samples,
+            dtype=result.dtype,
+            device=result.device,
+        ).view(1, 1, overlap_samples)
+        blended = result[..., -overlap_samples:] * (1.0 - weights) + next_audio[..., :overlap_samples] * weights
+        result = torch.cat((result[..., :-overlap_samples], blended, next_audio[..., overlap_samples:]), dim=-1)
+
+    return {"waveform": result.contiguous(), "sample_rate": sample_rate}
+
+
 class NWFNovelChapterPlanner:
     CATEGORY = "Novel Workflow"
     FUNCTION = "plan"
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "INT", "FLOAT", "STRING")
+    RETURN_TYPES = (
+        "STRING",
+        "STRING",
+        "STRING",
+        "INT",
+        "FLOAT",
+        "INT",
+        "STRING",
+        "STRING",
+        "STRING",
+        "STRING",
+    )
     RETURN_NAMES = (
         "image_prompts",
         "video_prompts",
         "shot_ids",
         "seeds",
         "durations",
+        "frame_counts",
+        "tts_texts",
+        "voice_profiles",
+        "transitions",
         "storyboard_json",
     )
-    OUTPUT_IS_LIST = (True, True, True, True, True, False)
+    OUTPUT_IS_LIST = (True, True, True, True, True, True, True, True, True, False)
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -177,15 +477,15 @@ class NWFNovelChapterPlanner:
                 ),
                 "seconds_per_shot": (
                     "FLOAT",
-                    {"default": 5.0, "min": 2.0, "max": 10.0, "step": 0.5},
+                    {"default": 5.0, "min": 4.5, "max": 6.0, "step": 0.25},
                 ),
                 "style_prompt": (
                     "STRING",
                     {
                         "multiline": True,
                         "default": (
-                            "cinematic Chinese live-action drama, realistic skin and fabric, "
-                            "production design, natural lighting, 16:9 film still, consistent color grade"
+                            "电影级中国真人影视质感，真实皮肤与织物纹理，精细美术置景，"
+                            "自然且有方向性的光线，16:9电影画幅，统一电影调色，细节清晰"
                         ),
                     },
                 ),
@@ -194,11 +494,12 @@ class NWFNovelChapterPlanner:
                     {
                         "multiline": True,
                         "default": (
-                            "text, subtitles, watermark, logo, duplicate people, malformed hands, "
-                            "extra fingers, inconsistent costume, low detail, oversaturated colors"
+                            "文字，字幕，水印，标志，重复人物，畸形手部，多余手指，脸部漂移，"
+                            "服装不一致，年龄变化，低清晰度，过度饱和，塑料皮肤"
                         ),
                     },
                 ),
+                "continuity_review": ("BOOLEAN", {"default": True}),
                 "base_seed": (
                     "INT",
                     {"default": 20260713, "min": 0, "max": MAX_SEED, "step": 1},
@@ -215,14 +516,11 @@ class NWFNovelChapterPlanner:
         }
 
     @staticmethod
-    def _request_storyboard(
-        chapter: str,
+    def _chat_completion(
         api_base: str,
         api_key_env: str,
         model: str,
-        max_shots: int,
-        seconds_per_shot: float,
-        style_prompt: str,
+        messages: list[dict[str, str]],
         temperature: float,
         timeout_seconds: int,
     ) -> dict[str, Any]:
@@ -230,54 +528,12 @@ class NWFNovelChapterPlanner:
         if not endpoint.endswith("/chat/completions"):
             endpoint += "/chat/completions"
 
-        system_prompt = f"""
-You are a film director and storyboard supervisor. Convert one complete Chinese novel chapter into a
-production-ready storyboard for an automated image-to-video pipeline.
-
-Return exactly one JSON object and no markdown. The schema is:
-{{
-  "project": {{"title": "...", "summary": "..."}},
-  "continuity_bible": {{
-    "visual_style": "...",
-    "characters": [{{"name": "...", "immutable_visual_description": "..."}}],
-    "locations": [{{"name": "...", "immutable_visual_description": "..."}}]
-  }},
-  "shots": [
-    {{
-      "id": "S001",
-      "title": "...",
-      "duration_seconds": {seconds_per_shot},
-      "image_prompt": "English prompt for Z-Image-Turbo",
-      "video_prompt": "English motion prompt for Wan 2.2 image-to-video",
-      "narration_or_dialogue": "Chinese text or empty string"
-    }}
-  ]
-}}
-
-Rules:
-- Use at most {max_shots} shots and cover the chapter from beginning to end in chronological order.
-- Prefer visually meaningful beats. Combine adjacent prose that would produce nearly identical shots.
-- Establish a strict continuity bible before writing shots.
-- Every image_prompt must be self-contained English. Repeat the exact immutable description for every
-  visible recurring character; never rely on pronouns or earlier shots.
-- Every image_prompt must specify subject, action, environment, shot size, camera angle, composition,
-  lighting, mood, and this global style: {style_prompt}
-- Keep one dominant visual moment per image. Do not ask the image model to render captions or dialogue.
-- Every video_prompt must describe only plausible subject motion, environmental motion, camera motion,
-  pace, and what must stay unchanged from the start image. Do not introduce a new character or location.
-- Keep each duration between 2 and 10 seconds, close to {seconds_per_shot} seconds.
-- Preserve the novel's facts. Do not invent major plot events.
-""".strip()
-
         body = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": chapter},
-            ],
+            "messages": messages,
             "temperature": temperature,
             "stream": False,
-            "max_tokens": 12000,
+            "max_tokens": 16000,
         }
         headers = {"Content-Type": "application/json"}
         api_key = os.environ.get(api_key_env.strip(), "") if api_key_env.strip() else ""
@@ -315,6 +571,133 @@ Rules:
                 f"storyboard: {str(response_body)[:1000]}"
             ) from error
 
+    @classmethod
+    def _request_storyboard(
+        cls,
+        chapter: str,
+        api_base: str,
+        api_key_env: str,
+        model: str,
+        max_shots: int,
+        seconds_per_shot: float,
+        style_prompt: str,
+        temperature: float,
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        system_prompt = f"""
+你是一名中国影视导演、分镜师和场记。请把一个完整的中文小说章节转换为可直接用于
+Z-Image-Turbo 文生图与 Wan 2.2 S2V 音频驱动视频的制作级分镜。
+
+只返回一个合法 JSON 对象，不要 Markdown，不要解释。JSON 键名保持下面的英文，所有用于模型的
+提示词和所有描述值必须使用简体中文：
+{{
+  "project": {{"title": "...", "summary": "..."}},
+  "continuity_bible": {{
+    "visual_style": "...",
+    "characters": [{{
+      "id": "C01", "name": "...", "gender": "male或female",
+      "identity_anchor": "不可变的中文身份描述：年龄、脸型、五官比例、肤色、发型发色、体型、辨识特征",
+      "default_wardrobe": "...", "voice_profile": "male或female"
+    }}],
+    "locations": [{{"id": "L01", "name": "...", "identity_anchor": "空间布局、材质、主光方向和固定道具"}}]
+  }},
+  "shots": [
+    {{
+      "id": "S001",
+      "sequence_id": "SEQ01",
+      "scene_id": "SC001",
+      "title": "...",
+      "duration_seconds": {seconds_per_shot},
+      "characters": ["C01"],
+      "primary_character_id": "C01",
+      "continuity_from_previous": "上一镜末尾的人物位置、视线、动作、道具、光线如何接到本镜；首镜为空",
+      "transition": "hard_cut或dissolve或match_cut",
+      "image_prompt": "给Z-Image-Turbo的完整中文提示词",
+      "video_prompt": "给Wan 2.2的完整中文动作与运镜提示词",
+      "audio_type": "dialogue或narration或none",
+      "speaker_id": "C01或空",
+      "speech_framing": "group或closeup或none",
+      "dialogue_text": "需要角色当场说出的简短中文台词或空字符串",
+      "narration_text": "画外旁白或空字符串"
+    }}
+  ]
+}}
+
+硬性规则：
+1. 最多 {max_shots} 镜，按章节时间顺序覆盖开端、发展、转折和结尾。一个场景尽量连续安排2-4镜，
+   不要把每句文字机械切成一镜。
+2. 先建立严格的角色与场景连续性圣经。identity_anchor 必须具体、可视、固定；同一人物绝不改变
+   年龄、脸型、五官比例、发型发色和辨识特征。characters 按画面叙事重要性排序，并明确
+   primary_character_id，连续镜头尽量保持同一个主身份角色。
+3. 每条 image_prompt 都必须是独立完整的中文提示词，并逐字重复所有可见角色的 identity_anchor。
+   必须明确：主体和动作、人物当下状态与微表情、环境与前中后景、景别、机位、镜头角度、构图法、
+   主光方向与光质、辅光/轮廓光、色温、综合色调、景深、材质细节、氛围，以及烟尘、雨雪、火花、
+   能量、体积光等实际存在的特效。统一风格为：{style_prompt}
+4. 连续场景必须遵守180度轴线、人物屏幕方向、视线匹配、动作匹配、服装、伤痕、道具位置、天气、
+   时间和光线连续。continuity_from_previous 要写成可执行的视觉承接，不要只写“承接上一镜”。
+5. video_prompt 必须使用中文，只描述起始图上可发生的主体动作、环境运动、特效变化、运镜、节奏和
+   必须保持不变的内容；不得凭空新增人物或场景，不得瞬移。
+6. 对白镜头必须填写 dialogue_text、speaker_id 和 speech_framing：
+   - group：对话关系和其他人的反应重要时用群像/双人中景，明确只有发言者动嘴，其他人闭嘴倾听。
+   - closeup：情绪爆发、关键信息或台词较长时切到发言者近景/特写，正面或轻微四分之三角度，
+     口部无遮挡。不要连续滥用特写；先有建立镜头再切近景。
+   每个对白镜头的台词应能在约 {seconds_per_shot} 秒内自然说完；过长台词拆成多个连续镜头。
+7. 旁白与对白严格分开。旁白不让画面人物动嘴。
+8. 场景内优先 hard_cut 或 match_cut；只有明显时间/地点变化才用 dissolve。
+9. 保留原文事实，不虚构重大剧情，不要求模型生成字幕、对白文字、水印或标志。
+""".strip()
+        return cls._chat_completion(
+            api_base=api_base,
+            api_key_env=api_key_env,
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": chapter},
+            ],
+            temperature=temperature,
+            timeout_seconds=timeout_seconds,
+        )
+
+    @classmethod
+    def _review_storyboard(
+        cls,
+        draft: dict[str, Any],
+        chapter: str,
+        api_base: str,
+        api_key_env: str,
+        model: str,
+        temperature: float,
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        review_prompt = """
+你是影视剧组的总场记和对白镜头审核员。检查草稿中的每一镜，并直接返回修订后的完整 JSON。
+只返回 JSON，不要解释。必须修复：
+- 角色 identity_anchor 是否在每条相关 image_prompt 中逐字一致；
+- 相邻镜头的轴线、屏幕方向、视线、动作、服装、伤痕、道具、天气、时间、光线和色调是否连续；
+- 构图、光线、色调、人物状态、景深、材质和特效是否写全；
+- 是否存在无意义跳切、重复镜头或地点突然变化；
+- 对白是否正确区分 group 群像说话与 closeup 本人近景说话；发言者必须唯一，口部可见，其他人闭嘴；
+- 旁白镜头不得让人物对口型；
+- 台词是否短到能在单镜时长内自然说完，过长则拆分连续镜头；
+- 所有 image_prompt 和 video_prompt 必须使用简体中文。
+不得改变小说的主要事实、人物关系和事件顺序。
+""".strip()
+        user_content = json.dumps(
+            {"source_chapter": chapter, "draft_storyboard": draft},
+            ensure_ascii=False,
+        )
+        return cls._chat_completion(
+            api_base=api_base,
+            api_key_env=api_key_env,
+            model=model,
+            messages=[
+                {"role": "system", "content": review_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=min(temperature, 0.25),
+            timeout_seconds=timeout_seconds,
+        )
+
     def plan(
         self,
         chapter,
@@ -325,6 +708,7 @@ Rules:
         seconds_per_shot,
         style_prompt,
         avoid_prompt,
+        continuity_review,
         base_seed,
         temperature,
         timeout_seconds,
@@ -344,6 +728,16 @@ Rules:
             temperature=temperature,
             timeout_seconds=timeout_seconds,
         )
+        if continuity_review:
+            payload = self._review_storyboard(
+                draft=payload,
+                chapter=chapter,
+                api_base=api_base,
+                api_key_env=api_key_env,
+                model=model,
+                temperature=temperature,
+                timeout_seconds=timeout_seconds,
+            )
         storyboard = _normalize_storyboard(
             payload,
             max_shots=max_shots,
@@ -366,8 +760,103 @@ Rules:
             [shot["id"] for shot in shots],
             [shot["seed"] for shot in shots],
             [shot["duration_seconds"] for shot in shots],
+            [shot["frame_count"] for shot in shots],
+            [shot["tts_text"] for shot in shots],
+            [shot["voice_profile"] for shot in shots],
+            [shot["transition"] for shot in shots],
             json.dumps(storyboard, ensure_ascii=False, indent=2),
         )
+
+
+class NWFTextToSpeech:
+    CATEGORY = "Novel Workflow"
+    FUNCTION = "synthesize"
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"forceInput": True}),
+                "voice_profile": ("STRING", {"forceInput": True}),
+                "target_duration": ("FLOAT", {"forceInput": True}),
+                "api_base": ("STRING", {"default": "http://127.0.0.1:8880/v1"}),
+                "api_key_env": ("STRING", {"default": "TTS_API_KEY"}),
+                "model": ("STRING", {"default": "kokoro"}),
+                "male_voice": ("STRING", {"default": "zm_yunxi"}),
+                "female_voice": ("STRING", {"default": "zf_xiaobei"}),
+                "narrator_voice": ("STRING", {"default": "zf_xiaoxiao"}),
+                "speed": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05}),
+                "silence_sample_rate": (
+                    "INT",
+                    {"default": 24000, "min": 8000, "max": 48000, "step": 1000},
+                ),
+            }
+        }
+
+    def synthesize(
+        self,
+        text,
+        voice_profile,
+        target_duration,
+        api_base,
+        api_key_env,
+        model,
+        male_voice,
+        female_voice,
+        narrator_voice,
+        speed,
+        silence_sample_rate,
+    ):
+        target_duration = float(target_duration)
+        text = str(text).strip()
+        if not text:
+            return (_silence_audio(target_duration, int(silence_sample_rate)),)
+
+        profile = str(voice_profile).strip().lower()
+        if profile == "female":
+            voice = female_voice
+        elif profile == "narrator":
+            voice = narrator_voice
+        else:
+            voice = male_voice
+
+        endpoint = api_base.rstrip("/")
+        if not endpoint.endswith("/audio/speech"):
+            endpoint += "/audio/speech"
+        body = {
+            "model": model,
+            "input": text,
+            "voice": voice,
+            "response_format": "wav",
+            "speed": float(speed),
+        }
+        headers = {"Content-Type": "application/json", "Accept": "audio/wav"}
+        api_key = os.environ.get(api_key_env.strip(), "") if api_key_env.strip() else ""
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
+                audio_bytes = response.read()
+        except urllib.error.HTTPError as error:
+            details = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"TTS API returned HTTP {error.code}: {details[:1000]}") from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"Could not reach the TTS API at {endpoint}: {error.reason}") from error
+
+        try:
+            audio = _decode_wav_bytes(audio_bytes)
+        except ValueError as error:
+            preview = audio_bytes[:500].decode("utf-8", errors="replace")
+            raise RuntimeError(f"TTS API returned invalid WAV data: {preview}") from error
+        return (_fit_audio_duration(audio, target_duration),)
 
 
 class NWFConcatVideos:
@@ -386,10 +875,13 @@ class NWFConcatVideos:
                     "INT",
                     {"default": 4, "min": 0, "max": 48, "step": 1},
                 ),
-            }
+            },
+            "optional": {
+                "transitions": ("STRING", {"forceInput": True}),
+            },
         }
 
-    def concat(self, videos, crossfade_frames):
+    def concat(self, videos, crossfade_frames, transitions=None):
         videos = list(videos or [])
         if not videos:
             raise ValueError("No shot videos were provided for concatenation.")
@@ -398,11 +890,18 @@ class NWFConcatVideos:
         fps_values = [float(component.frame_rate) for component in components]
         if max(fps_values) - min(fps_values) > 1e-6:
             raise ValueError(f"All clips must use the same frame rate. Got {fps_values}.")
-        if any(component.audio is not None for component in components):
-            raise ValueError("Audio concatenation is not supported. Connect silent Wan clips here.")
+        transitions = [str(item) for item in (transitions or [])]
 
         frames = _concat_frame_batches(
             [component.images for component in components],
+            int(_first(crossfade_frames, 0)),
+            transitions,
+        )
+        audio = _concat_audio_batches(
+            [component.audio for component in components],
+            [component.images.shape[0] for component in components],
+            fps_values[0],
+            transitions,
             int(_first(crossfade_frames, 0)),
         )
         bit_depth = videos[0].get_bit_depth() if hasattr(videos[0], "get_bit_depth") else 8
@@ -412,7 +911,7 @@ class NWFConcatVideos:
         output_video = InputImpl.VideoFromComponents(
             Types.VideoComponents(
                 images=frames,
-                audio=None,
+                audio=audio,
                 frame_rate=Fraction(components[0].frame_rate),
             ),
             bit_depth=bit_depth,
@@ -471,12 +970,14 @@ class NWFSaveText:
 
 NODE_CLASS_MAPPINGS = {
     "NWFNovelChapterPlanner": NWFNovelChapterPlanner,
+    "NWFTextToSpeech": NWFTextToSpeech,
     "NWFConcatVideos": NWFConcatVideos,
     "NWFSaveText": NWFSaveText,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NWFNovelChapterPlanner": "Novel Chapter to Storyboard",
+    "NWFTextToSpeech": "Dialogue Text to Speech",
     "NWFConcatVideos": "Concatenate Shot Videos",
     "NWFSaveText": "Save Storyboard JSON",
 }
