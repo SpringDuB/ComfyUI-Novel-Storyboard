@@ -26,7 +26,7 @@ MAX_SEED = 2**53 - 1
 S2V_FPS = 16
 S2V_MIN_FRAMES = 73
 S2V_MAX_FRAMES = 97
-S2V_MAX_DIALOGUE_FRAMES = 129
+S2V_DEFAULT_MAX_DIALOGUE_SECONDS = 15.0
 VOICE_SLOTS = tuple("ABCDEFGH")
 
 
@@ -1031,6 +1031,15 @@ class NWFTextToSpeech:
                     "INT",
                     {"default": 24000, "min": 8000, "max": 48000, "step": 1000},
                 ),
+                "max_dialogue_seconds": (
+                    "FLOAT",
+                    {
+                        "default": S2V_DEFAULT_MAX_DIALOGUE_SECONDS,
+                        "min": 6.0,
+                        "max": 30.0,
+                        "step": 0.5,
+                    },
+                ),
             }
         }
 
@@ -1166,8 +1175,9 @@ class NWFDialogueAudioGate:
         target_duration,
         silence_sample_rate,
         speech_audio=None,
+        max_dialogue_seconds=S2V_DEFAULT_MAX_DIALOGUE_SECONDS,
     ):
-        del target_duration, silence_sample_rate
+        del target_duration, silence_sample_rate, max_dialogue_seconds
         needs_speech = bool(str(_first(text, "")).strip())
         return ["speech_audio"] if needs_speech and speech_audio is None else []
 
@@ -1177,9 +1187,13 @@ class NWFDialogueAudioGate:
         target_duration,
         silence_sample_rate,
         speech_audio=None,
+        max_dialogue_seconds=S2V_DEFAULT_MAX_DIALOGUE_SECONDS,
     ):
         text = str(_first(text, "")).strip()
         target_duration = float(_first(target_duration, 5.0))
+        max_dialogue_seconds = float(
+            _first(max_dialogue_seconds, S2V_DEFAULT_MAX_DIALOGUE_SECONDS)
+        )
         if not text:
             frame_count = _s2v_frame_count(target_duration)
             duration = frame_count / S2V_FPS
@@ -1196,14 +1210,15 @@ class NWFDialogueAudioGate:
             )
 
         speech_duration = waveform.shape[-1] / int(audio["sample_rate"])
+        if speech_duration > max_dialogue_seconds:
+            raise ValueError(
+                f"Dialogue audio is {speech_duration:.2f}s, longer than the configured "
+                f"{max_dialogue_seconds:.2f}s single-shot limit. Split the line, increase "
+                "CosyVoice3 speed, or raise max_dialogue_seconds if GPU memory allows."
+            )
         required_duration = max(target_duration, speech_duration + 0.25)
         requested_frames = max(S2V_MIN_FRAMES, math.ceil(required_duration * S2V_FPS))
         frame_count = 1 + 4 * math.ceil((requested_frames - 1) / 4)
-        if frame_count > S2V_MAX_DIALOGUE_FRAMES:
-            raise ValueError(
-                f"Dialogue audio is {speech_duration:.2f}s, longer than the supported single-shot limit. "
-                "Split the line into consecutive shots or increase the CosyVoice3 speed."
-            )
         duration = frame_count / S2V_FPS
         return (_fit_audio_duration(audio, duration), frame_count)
 
