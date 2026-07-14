@@ -46,6 +46,82 @@ def _extract_json(text: str) -> dict[str, Any]:
     return json.loads(cleaned[start : end + 1])
 
 
+def _chat_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(part.get("text", "")) if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    return "" if content is None else str(content)
+
+
+def _read_streamed_chat_content(response: Any) -> str:
+    content_parts: list[str] = []
+    event_data: list[str] = []
+    plain_body: list[str] = []
+    saw_sse = False
+    finished = False
+
+    def consume_event() -> bool:
+        nonlocal event_data
+        if not event_data:
+            return False
+        payload = "\n".join(event_data).strip()
+        event_data = []
+        if not payload:
+            return False
+        if payload == "[DONE]":
+            return True
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"Storyboard API returned malformed SSE JSON: {payload[:1000]}") from error
+        if isinstance(event, dict) and event.get("error"):
+            raise RuntimeError(f"Storyboard API stream returned an error: {str(event['error'])[:1000]}")
+        try:
+            delta = event["choices"][0].get("delta", {})
+        except (KeyError, IndexError, TypeError, AttributeError):
+            return False
+        if isinstance(delta, dict):
+            text = _chat_content_text(delta.get("content"))
+            if text:
+                content_parts.append(text)
+        return False
+
+    for raw_line in response:
+        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+        plain_body.append(line)
+        line = line.rstrip("\r\n")
+        if not line:
+            if consume_event():
+                finished = True
+                break
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            saw_sse = True
+            event_data.append(line[5:].lstrip())
+
+    if not finished:
+        consume_event()
+    if saw_sse:
+        if not content_parts:
+            raise RuntimeError("Storyboard API stream ended without choices[0].delta.content.")
+        return "".join(content_parts)
+
+    try:
+        response_body = json.loads("".join(plain_body))
+        return _chat_content_text(response_body["choices"][0]["message"]["content"])
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+        raise RuntimeError(
+            "Storyboard API returned neither valid SSE data nor Chat Completions JSON: "
+            f"{''.join(plain_body)[:1000]}"
+        ) from error
+
+
 def _stable_seed(base_seed: int, key: str) -> int:
     digest = hashlib.sha256(key.encode("utf-8")).digest()
     offset = int.from_bytes(digest[:7], "big")
@@ -641,10 +717,13 @@ class NWFNovelChapterPlanner:
             "model": model,
             "messages": messages,
             "temperature": temperature,
-            "stream": False,
+            "stream": True,
             "max_tokens": 16000,
         }
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
         api_key = os.environ.get(api_key_env.strip(), "") if api_key_env.strip() else ""
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -657,7 +736,7 @@ class NWFNovelChapterPlanner:
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-                response_body = json.loads(response.read().decode("utf-8"))
+                content = _read_streamed_chat_content(response)
         except urllib.error.HTTPError as error:
             details = error.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Storyboard API returned HTTP {error.code}: {details[:1000]}") from error
@@ -667,17 +746,11 @@ class NWFNovelChapterPlanner:
             ) from error
 
         try:
-            content = response_body["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                content = "".join(
-                    str(part.get("text", "")) if isinstance(part, dict) else str(part)
-                    for part in content
-                )
             return _extract_json(str(content))
-        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as error:
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise RuntimeError(
-                "The storyboard API response was not valid Chat Completions JSON with a parseable "
-                f"storyboard: {str(response_body)[:1000]}"
+                "The streamed Chat Completions content did not contain a parseable storyboard JSON: "
+                f"{str(content)[:1000]}"
             ) from error
 
     @classmethod
