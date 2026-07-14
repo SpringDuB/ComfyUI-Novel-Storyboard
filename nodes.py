@@ -122,6 +122,32 @@ def _read_streamed_chat_content(response: Any) -> str:
         ) from error
 
 
+def _find_storyboard_payload(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    shots = value.get("shots")
+    if isinstance(shots, list) and any(
+        isinstance(shot, dict)
+        and str(shot.get("image_prompt", "")).strip()
+        and str(shot.get("video_prompt", "")).strip()
+        for shot in shots
+    ):
+        return value
+    for key in (
+        "revised_storyboard",
+        "storyboard",
+        "result",
+        "data",
+        "output",
+        "response",
+        "draft_storyboard",
+    ):
+        candidate = _find_storyboard_payload(value.get(key))
+        if candidate is not None:
+            return candidate
+    return None
+
+
 def _stable_seed(base_seed: int, key: str) -> int:
     digest = hashlib.sha256(key.encode("utf-8")).digest()
     offset = int.from_bytes(digest[:7], "big")
@@ -859,7 +885,8 @@ Z-Image-Turbo 文生图与 Wan 2.2 S2V 音频驱动视频的制作级分镜。
     ) -> dict[str, Any]:
         review_prompt = """
 你是影视剧组的总场记和对白镜头审核员。检查草稿中的每一镜，并直接返回修订后的完整 JSON。
-只返回 JSON，不要解释。必须修复：
+只返回 JSON，不要解释。顶级必须原样保留 project、continuity_bible、shots 三个字段；shots 必须是包含完整分镜的
+非空数组。禁止只返回审核意见，禁止返回空 shots，禁止套入 revised_storyboard、result 或 data 等外层字段。必须修复：
 - 角色 identity_anchor 是否在每条相关 image_prompt 中逐字一致；
 - 相邻镜头的轴线、屏幕方向、视线、动作、服装、伤痕、道具、天气、时间、光线和色调是否连续；
 - 构图、光线、色调、人物状态、景深、材质和特效是否写全；
@@ -876,7 +903,7 @@ Z-Image-Turbo 文生图与 Wan 2.2 S2V 音频驱动视频的制作级分镜。
             {"source_chapter": chapter, "draft_storyboard": draft},
             ensure_ascii=False,
         )
-        return cls._chat_completion(
+        reviewed_raw = cls._chat_completion(
             api_base=api_base,
             api_key_env=api_key_env,
             model=model,
@@ -887,6 +914,24 @@ Z-Image-Turbo 文生图与 Wan 2.2 S2V 音频驱动视频的制作级分镜。
             temperature=min(temperature, 0.25),
             timeout_seconds=timeout_seconds,
         )
+        reviewed = _find_storyboard_payload(reviewed_raw)
+        draft_storyboard = _find_storyboard_payload(draft)
+        if draft_storyboard is None:
+            raise ValueError("The initial storyboard draft did not contain any usable shots.")
+        if reviewed is None:
+            keys = ", ".join(str(key) for key in reviewed_raw.keys()) or "<none>"
+            print(
+                "[NWFNovelChapterPlanner] WARNING: continuity review returned no usable shots "
+                f"(top-level keys: {keys}); keeping the valid initial draft."
+            )
+            return draft_storyboard
+
+        merged = {**draft_storyboard, **reviewed}
+        if not isinstance(reviewed.get("project"), dict):
+            merged["project"] = draft_storyboard.get("project", {})
+        if not isinstance(reviewed.get("continuity_bible"), dict):
+            merged["continuity_bible"] = draft_storyboard.get("continuity_bible", {})
+        return merged
 
     def plan(
         self,
@@ -918,6 +963,7 @@ Z-Image-Turbo 文生图与 Wan 2.2 S2V 音频驱动视频的制作级分镜。
             temperature=temperature,
             timeout_seconds=timeout_seconds,
         )
+        payload = _find_storyboard_payload(payload) or payload
         if continuity_review:
             payload = self._review_storyboard(
                 draft=payload,
