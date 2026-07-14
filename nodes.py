@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import time
@@ -25,6 +26,8 @@ MAX_SEED = 2**53 - 1
 S2V_FPS = 16
 S2V_MIN_FRAMES = 73
 S2V_MAX_FRAMES = 97
+S2V_MAX_DIALOGUE_FRAMES = 129
+VOICE_SLOTS = tuple("ABCDEFGH")
 
 
 def _first(value: Any, default: Any = None) -> Any:
@@ -62,6 +65,61 @@ def _s2v_frame_count(duration: float) -> int:
     return int(1 + 4 * round((requested - 1) / 4))
 
 
+def _assign_voice_slots(
+    characters: dict[str, dict[str, Any]],
+    raw_shots: list[Any],
+) -> dict[str, str]:
+    speaking_order: list[str] = []
+    for raw in raw_shots:
+        if not isinstance(raw, dict):
+            continue
+        dialogue = str(raw.get("dialogue_text", "")).strip()
+        speaker_id = str(raw.get("speaker_id", "")).strip()
+        if dialogue and not speaker_id:
+            candidates = [
+                str(raw.get("primary_character_id", "")).strip(),
+                *_as_string_list(raw.get("characters")),
+            ]
+            speaker_id = next((candidate for candidate in candidates if candidate), "")
+            if speaker_id:
+                raw["speaker_id"] = speaker_id
+        if dialogue and speaker_id and speaker_id not in speaking_order:
+            speaking_order.append(speaker_id)
+        if speaker_id and speaker_id not in characters:
+            characters[speaker_id] = {
+                "id": speaker_id,
+                "name": speaker_id,
+                "gender": "unknown",
+                "identity_anchor": "",
+                "voice_profile": "male",
+                "voice_identity": "成年普通话声线，音色自然，语速适中",
+            }
+
+    assigned: dict[str, str] = {}
+    used: set[str] = set()
+    for character_id in speaking_order:
+        requested = str(characters[character_id].get("voice_slot", "")).strip().upper()
+        if requested in VOICE_SLOTS and requested not in used:
+            assigned[character_id] = requested
+            used.add(requested)
+
+    for character_id in speaking_order:
+        if character_id in assigned:
+            continue
+        available = next((slot for slot in VOICE_SLOTS if slot not in used), None)
+        if available is None:
+            raise ValueError(
+                "A single workflow supports up to eight speaking characters. "
+                "Split the chapter or remove dialogue from minor roles beyond voice slot H."
+            )
+        assigned[character_id] = available
+        used.add(available)
+
+    for character_id, character in characters.items():
+        character["voice_slot"] = assigned.get(character_id, "")
+    return assigned
+
+
 def _normalize_storyboard(
     payload: dict[str, Any],
     *,
@@ -95,13 +153,22 @@ def _normalize_storyboard(
             voice_profile = str(character.get("voice_profile", "")).strip().lower()
             if voice_profile not in {"male", "female", "narrator"}:
                 voice_profile = "female" if gender in {"female", "woman", "女"} else "male"
+            voice_identity = str(character.get("voice_identity", "")).strip()
+            if not voice_identity:
+                voice_identity = (
+                    "成年女性普通话声线，音色自然，音高中等，语速适中"
+                    if voice_profile == "female"
+                    else "成年男性普通话声线，音色自然，音高中低，语速适中"
+                )
             characters[character_id] = {
                 **character,
                 "id": character_id,
                 "name": name,
                 "identity_anchor": identity_anchor,
                 "voice_profile": voice_profile,
+                "voice_identity": voice_identity,
             }
+    voice_slots = _assign_voice_slots(characters, raw_shots)
     if characters:
         continuity_bible["characters"] = list(characters.values())
 
@@ -177,12 +244,31 @@ def _normalize_storyboard(
                 )
             video_prompt = f"{video_prompt}。{speech_instruction}"
             tts_text = dialogue_text
-            voice_profile = characters.get(speaker_id, {}).get("voice_profile", "male")
+            speaker = characters.get(speaker_id, {})
+            voice_profile = speaker.get("voice_profile", "male")
+            voice_slot = voice_slots.get(speaker_id, "")
+            voice_identity = speaker.get("voice_identity", "成年普通话声线，音色自然，语速适中")
+            performance = str(
+                raw.get("voice_instruction")
+                or raw.get("speaking_style")
+                or "贴合当前剧情和人物情绪，自然克制地说话"
+            ).strip()
+            if not re.search(r"[\u3400-\u9fff]", performance):
+                performance = "贴合当前剧情和人物情绪，自然克制地说话"
+            voice_instruction = (
+                f"严格保持参考音频中的同一人物声线身份，固定为：{voice_identity}。"
+                "不得改变年龄感、基础音色、音高范围、口音和基础说话节奏；"
+                f"本句只调整表演状态：{performance}。使用自然清晰的普通话，避免播音腔和夸张表演。"
+            )
+            voice_seed = _stable_seed(base_seed, f"voice:{speaker_id}")
         else:
             speech_framing = "none"
             video_prompt = f"{video_prompt}。所有可见人物保持闭嘴，不做说话口型，只做符合情境的自然呼吸和表情变化。"
             tts_text = ""
             voice_profile = "narrator"
+            voice_slot = ""
+            voice_instruction = ""
+            voice_seed = _stable_seed(base_seed, "voice:silence")
 
         video_prompt = (
             f"{video_prompt}。严格保持起始图中的人物身份、五官、发型、服装、场景布局、色调和光线不变；"
@@ -238,6 +324,9 @@ def _normalize_storyboard(
                 "narration_text": narration_text,
                 "tts_text": tts_text,
                 "voice_profile": voice_profile,
+                "voice_slot": voice_slot,
+                "voice_instruction": voice_instruction,
+                "voice_seed": voice_seed,
                 "seed_group": seed_key,
                 "seed": _stable_seed(base_seed, seed_key),
             }
@@ -433,6 +522,9 @@ class NWFNovelChapterPlanner:
         "STRING",
         "STRING",
         "STRING",
+        "INT",
+        "STRING",
+        "STRING",
     )
     RETURN_NAMES = (
         "image_prompts",
@@ -443,10 +535,27 @@ class NWFNovelChapterPlanner:
         "frame_counts",
         "tts_texts",
         "voice_profiles",
+        "voice_slots",
+        "voice_instructions",
+        "voice_seeds",
         "transitions",
         "storyboard_json",
     )
-    OUTPUT_IS_LIST = (True, True, True, True, True, True, True, True, True, False)
+    OUTPUT_IS_LIST = (
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        True,
+        False,
+    )
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -597,7 +706,9 @@ Z-Image-Turbo 文生图与 Wan 2.2 S2V 音频驱动视频的制作级分镜。
     "characters": [{{
       "id": "C01", "name": "...", "gender": "male或female",
       "identity_anchor": "不可变的中文身份描述：年龄、脸型、五官比例、肤色、发型发色、体型、辨识特征",
-      "default_wardrobe": "...", "voice_profile": "male或female"
+      "default_wardrobe": "...", "voice_profile": "male或female",
+      "voice_slot": "A到H中的唯一字母，仅有台词的角色需要",
+      "voice_identity": "不可变的中文声线档案：年龄感、音色厚薄、音高范围、口音、咬字、基础语速与节奏"
     }}],
     "locations": [{{"id": "L01", "name": "...", "identity_anchor": "空间布局、材质、主光方向和固定道具"}}]
   }},
@@ -618,6 +729,7 @@ Z-Image-Turbo 文生图与 Wan 2.2 S2V 音频驱动视频的制作级分镜。
       "speaker_id": "C01或空",
       "speech_framing": "group或closeup或none",
       "dialogue_text": "需要角色当场说出的简短中文台词或空字符串",
+      "voice_instruction": "本句的情绪强度、气息、音量和表演状态；不得改写角色的固定声线身份",
       "narration_text": "画外旁白或空字符串"
     }}
   ]
@@ -628,7 +740,8 @@ Z-Image-Turbo 文生图与 Wan 2.2 S2V 音频驱动视频的制作级分镜。
    不要把每句文字机械切成一镜。
 2. 先建立严格的角色与场景连续性圣经。identity_anchor 必须具体、可视、固定；同一人物绝不改变
    年龄、脸型、五官比例、发型发色和辨识特征。characters 按画面叙事重要性排序，并明确
-   primary_character_id，连续镜头尽量保持同一个主身份角色。
+   primary_character_id，连续镜头尽量保持同一个主身份角色。所有有台词角色还必须建立不可变的
+   voice_identity，并按首次发言顺序分配唯一 voice_slot A-H；同一角色全章不得改变槽位或声线档案。
 3. 每条 image_prompt 都必须是独立完整的中文提示词，并逐字重复所有可见角色的 identity_anchor。
    必须明确：主体和动作、人物当下状态与微表情、环境与前中后景、景别、机位、镜头角度、构图法、
    主光方向与光质、辅光/轮廓光、色温、综合色调、景深、材质细节、氛围，以及烟尘、雨雪、火花、
@@ -642,6 +755,8 @@ Z-Image-Turbo 文生图与 Wan 2.2 S2V 音频驱动视频的制作级分镜。
    - closeup：情绪爆发、关键信息或台词较长时切到发言者近景/特写，正面或轻微四分之三角度，
      口部无遮挡。不要连续滥用特写；先有建立镜头再切近景。
    每个对白镜头的台词应能在约 {seconds_per_shot} 秒内自然说完；过长台词拆成多个连续镜头。
+   voice_instruction 只描述本句情绪、气息、音量与表演强度，必须要求保持参考音色、年龄感、口音
+   和基础节奏，不得用“换成另一种声线”之类会改变角色身份的指令。
 7. 旁白与对白严格分开。旁白不让画面人物动嘴。
 8. 场景内优先 hard_cut 或 match_cut；只有明显时间/地点变化才用 dissolve。
 9. 保留原文事实，不虚构重大剧情，不要求模型生成字幕、对白文字、水印或标志。
@@ -677,6 +792,8 @@ Z-Image-Turbo 文生图与 Wan 2.2 S2V 音频驱动视频的制作级分镜。
 - 构图、光线、色调、人物状态、景深、材质和特效是否写全；
 - 是否存在无意义跳切、重复镜头或地点突然变化；
 - 对白是否正确区分 group 群像说话与 closeup 本人近景说话；发言者必须唯一，口部可见，其他人闭嘴；
+- 每个有台词角色是否具有唯一且全章不变的 voice_slot A-H 和具体 voice_identity；每镜 voice_instruction
+  是否只改变情绪表演而不改变音色、年龄感、口音与基础节奏；
 - 旁白镜头不得让人物对口型；
 - 台词是否短到能在单镜时长内自然说完，过长则拆分连续镜头；
 - 所有 image_prompt 和 video_prompt 必须使用简体中文。
@@ -763,6 +880,9 @@ Z-Image-Turbo 文生图与 Wan 2.2 S2V 音频驱动视频的制作级分镜。
             [shot["frame_count"] for shot in shots],
             [shot["tts_text"] for shot in shots],
             [shot["voice_profile"] for shot in shots],
+            [shot["voice_slot"] for shot in shots],
+            [shot["voice_instruction"] for shot in shots],
+            [shot["voice_seed"] for shot in shots],
             [shot["transition"] for shot in shots],
             json.dumps(storyboard, ensure_ascii=False, indent=2),
         )
@@ -857,6 +977,116 @@ class NWFTextToSpeech:
             preview = audio_bytes[:500].decode("utf-8", errors="replace")
             raise RuntimeError(f"TTS API returned invalid WAV data: {preview}") from error
         return (_fit_audio_duration(audio, target_duration),)
+
+
+class NWFSelectVoiceReference:
+    CATEGORY = "Novel Workflow"
+    FUNCTION = "select"
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("reference_audio",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "voice_slot": ("STRING", {"forceInput": True}),
+            },
+            "optional": {
+                f"speaker_{slot}": ("AUDIO", {"lazy": True}) for slot in VOICE_SLOTS
+            },
+        }
+
+    @staticmethod
+    def _input_name(voice_slot: Any) -> str:
+        slot = str(_first(voice_slot, "")).strip().upper()
+        if slot not in VOICE_SLOTS:
+            raise ValueError(
+                f"Invalid or missing voice slot '{slot}'. Expected one of {', '.join(VOICE_SLOTS)}."
+            )
+        return f"speaker_{slot}"
+
+    def check_lazy_status(self, voice_slot, **speaker_audio):
+        input_name = self._input_name(voice_slot)
+        return [input_name] if speaker_audio.get(input_name) is None else []
+
+    def select(self, voice_slot, **speaker_audio):
+        input_name = self._input_name(voice_slot)
+        audio = speaker_audio.get(input_name)
+        if audio is None:
+            raise ValueError(
+                f"Voice slot {input_name[-1]} is used by this chapter, but its reference audio is not connected."
+            )
+        return (_first(audio),)
+
+
+class NWFDialogueAudioGate:
+    CATEGORY = "Novel Workflow"
+    FUNCTION = "fit"
+    RETURN_TYPES = ("AUDIO", "INT")
+    RETURN_NAMES = ("audio", "frame_count")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"forceInput": True}),
+                "target_duration": ("FLOAT", {"forceInput": True}),
+                "silence_sample_rate": (
+                    "INT",
+                    {"default": 24000, "min": 8000, "max": 48000, "step": 1000},
+                ),
+            },
+            "optional": {
+                "speech_audio": ("AUDIO", {"lazy": True}),
+            },
+        }
+
+    def check_lazy_status(
+        self,
+        text,
+        target_duration,
+        silence_sample_rate,
+        speech_audio=None,
+    ):
+        del target_duration, silence_sample_rate
+        needs_speech = bool(str(_first(text, "")).strip())
+        return ["speech_audio"] if needs_speech and speech_audio is None else []
+
+    def fit(
+        self,
+        text,
+        target_duration,
+        silence_sample_rate,
+        speech_audio=None,
+    ):
+        text = str(_first(text, "")).strip()
+        target_duration = float(_first(target_duration, 5.0))
+        if not text:
+            frame_count = _s2v_frame_count(target_duration)
+            duration = frame_count / S2V_FPS
+            return (_silence_audio(duration, int(_first(silence_sample_rate, 24000))), frame_count)
+
+        audio = _first(speech_audio)
+        if not isinstance(audio, dict) or "waveform" not in audio or "sample_rate" not in audio:
+            raise ValueError("CosyVoice3 did not return a valid ComfyUI AUDIO value.")
+        waveform = audio["waveform"]
+        if waveform.numel() == 0 or float(waveform.abs().max()) < 1e-7:
+            raise RuntimeError(
+                "CosyVoice3 returned silent audio for non-empty dialogue. Check the model, reference audio, "
+                "and ComfyUI console for the original synthesis error."
+            )
+
+        speech_duration = waveform.shape[-1] / int(audio["sample_rate"])
+        required_duration = max(target_duration, speech_duration + 0.25)
+        requested_frames = max(S2V_MIN_FRAMES, math.ceil(required_duration * S2V_FPS))
+        frame_count = 1 + 4 * math.ceil((requested_frames - 1) / 4)
+        if frame_count > S2V_MAX_DIALOGUE_FRAMES:
+            raise ValueError(
+                f"Dialogue audio is {speech_duration:.2f}s, longer than the supported single-shot limit. "
+                "Split the line into consecutive shots or increase the CosyVoice3 speed."
+            )
+        duration = frame_count / S2V_FPS
+        return (_fit_audio_duration(audio, duration), frame_count)
 
 
 class NWFConcatVideos:
@@ -971,6 +1201,8 @@ class NWFSaveText:
 NODE_CLASS_MAPPINGS = {
     "NWFNovelChapterPlanner": NWFNovelChapterPlanner,
     "NWFTextToSpeech": NWFTextToSpeech,
+    "NWFSelectVoiceReference": NWFSelectVoiceReference,
+    "NWFDialogueAudioGate": NWFDialogueAudioGate,
     "NWFConcatVideos": NWFConcatVideos,
     "NWFSaveText": NWFSaveText,
 }
@@ -978,6 +1210,8 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "NWFNovelChapterPlanner": "Novel Chapter to Storyboard",
     "NWFTextToSpeech": "Dialogue Text to Speech",
+    "NWFSelectVoiceReference": "Select Character Voice Reference",
+    "NWFDialogueAudioGate": "Dialogue Audio Gate and Duration",
     "NWFConcatVideos": "Concatenate Shot Videos",
     "NWFSaveText": "Save Storyboard JSON",
 }
